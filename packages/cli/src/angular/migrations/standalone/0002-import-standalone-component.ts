@@ -154,6 +154,12 @@ async function migrateAngularComponentClass(
         componentClassName,
         "@ionic/angular/standalone",
       );
+      /**
+       * This removes the import from the class, if it is present.
+       * An example where it may exist is when the developer has
+       * a @ViewChild decorator that references an ionic component.
+       */
+      removeImportFromClass(sourceFile, componentClassName, "@ionic/angular");
     } else if (ngModuleSourceFile) {
       const componentClassName = kebabCaseToPascalCase(ionicComponent);
 
@@ -239,10 +245,12 @@ function detectIonicComponentsAndIcons(htmlAsString: string, filePath: string) {
   let hasRouterLink = false;
 
   const recursivelyFindIonicComponents = (node: any) => {
-    if (node.type === "Element$1") {
-      if (IONIC_COMPONENTS.includes(node.name)) {
-        if (!ionicComponents.includes(node.name)) {
-          ionicComponents.push(node.name);
+    if (node.type === "Element$1" || node.type === "Template") {
+      const tagName = node.type === "Template" ? node.tagName : node.name;
+
+      if (IONIC_COMPONENTS.includes(tagName)) {
+        if (!ionicComponents.includes(tagName)) {
+          ionicComponents.push(tagName);
         }
 
         const routerLink =
@@ -259,40 +267,70 @@ function detectIonicComponentsAndIcons(htmlAsString: string, filePath: string) {
       }
 
       if (node.name === "ion-icon") {
-        const staticNameAttribute = node.attributes.find(
-          (a: any) => a.name === "name" || a.name === "icon",
-        );
-
-        if (staticNameAttribute) {
-          const iconName = staticNameAttribute.value;
-          if (!ionIcons.includes(iconName)) {
-            ionIcons.push(iconName);
-          }
-        } else {
-          const boundNameAttribute = node.inputs.find(
-            (a: any) => a.name === "name" || a.name === "icon",
+        for (const attribute of ["name", "icon", "ios", "md"]) {
+          const staticNameAttribute = node.attributes.find(
+            (a: any) => a.name === attribute,
           );
 
-          if (boundNameAttribute) {
-            const skippedIcon = node.sourceSpan.toString();
+          if (staticNameAttribute) {
+            const iconName = staticNameAttribute.value;
+            if (!ionIcons.includes(iconName)) {
+              ionIcons.push(iconName);
+            }
+          } else {
+            const boundNameAttribute = node.inputs.find(
+              (a: any) => a.name === attribute,
+            );
 
-            const iconNameRegex = /{{\s*'([^']+)'\s*}}/;
-            /**
-             * Attempt to find the icon name from the bound name attribute
-             * when the developer has a template like this:
-             * <ion-icon name="'user'"></ion-icon>
-             */
-            const iconNameMatch = skippedIcon.match(iconNameRegex);
+            if (boundNameAttribute) {
+              const skippedIcon = node.sourceSpan.toString();
 
-            if (iconNameMatch) {
-              if (!ionIcons.includes(iconNameMatch[1])) {
-                ionIcons.push(iconNameMatch[1]);
+              const iconNameRegex = /{{\s*'([^']+)'\s*}}/;
+              /**
+               * Attempt to find the icon name from the bound name attribute
+               * when the developer has a template like this:
+               * <ion-icon name="'user'"></ion-icon>
+               */
+              const iconNameMatch = skippedIcon.match(iconNameRegex);
+
+              const deepGetIconConditional = (
+                ast: typeof boundNameAttribute.value.ast,
+                icons: string[],
+              ): string[] => {
+                if (ast.trueExp.type === "LiteralPrimitive") {
+                  if (!ionIcons.includes(ast.trueExp.value)) {
+                    ionIcons.push(ast.trueExp.value);
+                  }
+                } else if (ast.trueExp.type === "Conditional") {
+                  deepGetIconConditional(ast.trueExp, icons);
+                } else {
+                  skippedIconsHtml.push(skippedIcon);
+                }
+
+                if (ast.falseExp.type === "LiteralPrimitive") {
+                  if (!ionIcons.includes(ast.falseExp.value)) {
+                    ionIcons.push(ast.falseExp.value);
+                  }
+                } else if (ast.falseExp.type === "Conditional") {
+                  deepGetIconConditional(ast.falseExp, icons);
+                } else {
+                  skippedIconsHtml.push(skippedIcon);
+                }
+                return icons;
+              };
+
+              if (iconNameMatch) {
+                if (!ionIcons.includes(iconNameMatch[1])) {
+                  ionIcons.push(iconNameMatch[1]);
+                }
+              } else if (boundNameAttribute.value.ast.type === "Conditional") {
+                deepGetIconConditional(boundNameAttribute.value.ast, ionIcons);
+              } else {
+                // IonIcon name is a calculated value from a variable or function.
+                // We can't determine the value of the name at this time.
+                // The developer will need to manually import these icons.
+                skippedIconsHtml.push(skippedIcon);
               }
-            } else {
-              // IonIcon name is a calculated value from a variable or function.
-              // We can't determine the value of the name at this time.
-              // The developer will need to manually import these icons.
-              skippedIconsHtml.push(skippedIcon);
             }
           }
         }
@@ -315,6 +353,40 @@ function detectIonicComponentsAndIcons(htmlAsString: string, filePath: string) {
       if (node.children.length > 0) {
         for (const childNode of node.children) {
           recursivelyFindIonicComponents(childNode);
+        }
+      }
+    } else if (node.type === "IfBlock") {
+      for (const branch of node.branches) {
+        for (const childNode of branch.children) {
+          recursivelyFindIonicComponents(childNode);
+        }
+      }
+    } else if (node.type === "ForLoopBlock") {
+      for (const childNode of node.children) {
+        recursivelyFindIonicComponents(childNode);
+      }
+    } else if (node.type === "SwitchBlock") {
+      for (const c of node.cases) {
+        for (const childNode of c.children) {
+          recursivelyFindIonicComponents(childNode);
+        }
+      }
+    } else if (node.type === "DeferredBlock") {
+      if (node.children) {
+        for (const childNode of node.children) {
+          recursivelyFindIonicComponents(childNode);
+        }
+      }
+
+      for (const childKey of Object.keys(node)) {
+        if (node[childKey]?.children) {
+          for (const childNode of node[childKey].children) {
+            recursivelyFindIonicComponents(
+              Object.assign(childNode, {
+                type: childNode.constructor.name,
+              }),
+            );
+          }
         }
       }
     }
